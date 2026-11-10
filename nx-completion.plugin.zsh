@@ -38,6 +38,7 @@ _nx_caching_policy() {
 
 # Global configuration for maximum number of completion results
 typeset -g NX_MAX_RESULTS=30
+typeset -g NX_MAX_OPTIONS=100 # cap for per-command option lists (executor schemas can be large)
 
 # Set up zsh completion styles for nx to ensure menu completion
 zstyle ':completion:*:*:nx:*' menu yes select
@@ -235,6 +236,14 @@ _get_workspace_items_array() {
         items=($(<"$def" | jq -r '.nodes[] | .name as $project | .data.targets | keys[] | $project + ":" + .' 2>/dev/null))
       fi
       ;;
+    targets_all)
+      # Uncapped list of distinct target names (used for membership checks)
+      if [[ "$nodes_path" == ".graph.nodes" ]]; then
+        items=($(jq -r '[.graph.nodes[] | .data.targets | keys[]] | unique[]' "$def"))
+      else
+        items=($(jq -r '[.nodes[] | .data.targets | keys[]] | unique[]' "$def"))
+      fi
+      ;;
   esac
 
   # Cache the results if we got any
@@ -258,8 +267,10 @@ _workspace_projects() {
 
 _nx_workspace_targets() {
   local -a targets
-  if _get_workspace_items_array "targets" targets; then
-    echo "${targets[@]}"
+  # Uncapped: every workspace target should be offered as a command.
+  # Colons are escaped because _describe treats them as name:description separators.
+  if _get_workspace_items_array "targets_all" targets; then
+    echo "${(@)targets//:/\\:}"
   fi
 }
 
@@ -360,6 +371,48 @@ _complete_workspace_items() {
     fi
   fi
 
+  return ret
+}
+
+# Complete only the projects that define a given target (e.g. `nx build <tab>`
+# should not offer projects without a `build` target).
+_nx_list_projects_for_target() {
+  local target="$1"
+  [[ $PREFIX = -* ]] && return 1
+  integer ret=1
+
+  local cache_key="nx_projects_for_${target//[^a-zA-Z0-9]/_}"
+  local cache_policy
+  zstyle -s ":completion:${curcontext}:" cache-policy cache_policy
+  if [[ -z "$cache_policy" ]]; then
+    zstyle ":completion:${curcontext}:" cache-policy _nx_caching_policy
+  fi
+
+  local -a projects=()
+  if ( [[ ${(P)+cache_key} -eq 1 ]] && ! _cache_invalid "$cache_key" ); then
+    projects=("${(@P)cache_key}")
+  else
+    local def=$(_workspace_def)
+    if [[ -f "$def" ]]; then
+      projects=(${(f)"$(jq -r --arg t "$target" '
+        (.graph.nodes // .nodes)[] | select(.data.targets[$t]? != null) | .name
+      ' "$def" 2>/dev/null)"})
+      if [[ ${#projects} -gt 0 ]]; then
+        eval "${cache_key}=(\"\${projects[@]}\")"
+        _store_cache "$cache_key" "${cache_key}"
+      fi
+    fi
+  fi
+
+  # Nothing defines this target (or the graph is unavailable): fall back to all projects
+  if [[ ${#projects} -eq 0 ]]; then
+    _list_projects
+    return
+  fi
+
+  local expl
+  _description nx-projects expl "Nx projects with a '$target' target"
+  compadd "$expl[@]" -a projects && ret=0
   return ret
 }
 
@@ -599,7 +652,52 @@ _nx_get_executors() {
   return ret
 }
 
-# Extract executor options from project graph for a specific executor
+# Read option definitions from an executor's schema.json (e.g. @nx/eslint:lint).
+# Prints one _arguments spec per line; prints nothing if the schema can't be found
+# (local executors like ./tools/executors/foo:bar are not resolved).
+_nx_get_executor_schema_options() {
+  local executor="$1"
+  [[ "$executor" == *:* && "$executor" != .* && "$executor" != /* ]] || return 1
+  local pkg="${executor%:*}" name="${executor##*:}"
+
+  # Find the package by walking up from the current dir (works for hoisted and pnpm layouts)
+  local dir="$PWD" pkg_dir=""
+  while true; do
+    if [[ -f "$dir/node_modules/$pkg/package.json" ]]; then
+      pkg_dir="$dir/node_modules/$pkg"
+      break
+    fi
+    [[ "$dir" == "/" ]] && break
+    dir="${dir:h}"
+  done
+  [[ -n "$pkg_dir" ]] || return 1
+
+  # package.json -> "executors" (or legacy "builders") -> collection file -> schema
+  local collection=$(jq -r '(.executors // .builders) | strings' "$pkg_dir/package.json" 2>/dev/null)
+  [[ -n "$collection" ]] || return 1
+  local collection_file="$pkg_dir/${collection#./}"
+  [[ -f "$collection_file" ]] || return 1
+  local schema_rel=$(jq -r --arg n "$name" '((.executors // .builders // {})[$n].schema) // empty' "$collection_file" 2>/dev/null)
+  [[ -n "$schema_rel" ]] || return 1
+  local schema_file="${collection_file:h}/${schema_rel#./}"
+  [[ -f "$schema_file" ]] || return 1
+
+  jq -r '
+    def clean: gsub("[\\[\\]\\\\\n\r]"; " ") | gsub("\\s+"; " ") | gsub("^ | $"; "") | .[0:100] | gsub(":"; "\\:");
+    (.properties // {}) | to_entries[]
+    | select(.value.hidden != true)
+    | .key as $k
+    | ((.value.description // $k) | clean) as $d
+    | ([(.value.enum // [])[] | strings | select(test("^[A-Za-z0-9._-]+$"))] | join(" ")) as $enum
+    | if .value.type == "boolean" then "--\($k)[\($d)]"
+      elif $enum != "" then "--\($k)=[\($d)]:\($k):(\($enum))"
+      else "--\($k)=[\($d)]:\($k):" end
+  ' "$schema_file" 2>/dev/null
+}
+
+# Get options for an executor: its schema.json options (full list with descriptions),
+# plus any extra option keys that projects set in their target config.
+# Prints one _arguments spec per line.
 _nx_get_executor_options() {
   local executor="$1"
   integer ret=1
@@ -614,44 +712,50 @@ _nx_get_executor_options() {
 
   # Check cache first
   if ( [[ ${(P)+cache_key} -eq 1 ]] && ! _cache_invalid "$cache_key" ); then
-    echo "${(P)cache_key[@]}"
+    print -rl -- "${(@P)cache_key}"
     return 0
   fi
 
+  local -a all_options=()
+
+  # 1. Options declared by the executor's schema
+  all_options=(${(f)"$(_nx_get_executor_schema_options "$executor")"})
+
+  # 2. Option keys configured in projects that the schema doesn't declare
   local def=$(_workspace_def)
   if [[ -f "$def" ]]; then
-    # Get all option keys for this executor across all projects
-    local nodes_path=$(_get_nodes_path "$def")
-    local -a all_options=()
+    local -A seen=()
+    local spec
+    for spec in $all_options; do
+      seen[${spec%%[=\[]*}]=1
+    done
 
+    local nodes_path=$(_get_nodes_path "$def")
+    local -a config_options=()
     if [[ "$nodes_path" == ".graph.nodes" ]]; then
-      all_options=($(jq -r --arg exec "$executor" '
+      config_options=($(jq -r --arg exec "$executor" '
         [.graph.nodes[] | .data.targets[]? | select(.executor == $exec) | .options // {} | keys[]] |
         unique |
         map("--" + . + "[" + . + "]") |
         .[]' "$def" 2>/dev/null))
     else
-      all_options=($(jq -r --arg exec "$executor" '
+      config_options=($(jq -r --arg exec "$executor" '
         [.nodes[] | .data.targets[]? | select(.executor == $exec) | .options // {} | keys[]] |
         unique |
         map("--" + . + "[" + . + "]") |
         .[]' "$def" 2>/dev/null))
     fi
+    for spec in $config_options; do
+      [[ -z "${seen[${spec%%[=\[]*}]}" ]] && all_options+=("$spec")
+    done
+  fi
 
-    # Limit results and cache them
-    local -a limited_options=()
-    if [[ ${#all_options} -gt $NX_MAX_RESULTS ]]; then
-      limited_options=(${all_options[1,$NX_MAX_RESULTS]})
-    else
-      limited_options=($all_options[@])
-    fi
-
-    # Cache the results if we got any
-    if [[ ${#limited_options} -gt 0 ]]; then
-      eval "${cache_key}=(\"\${limited_options[@]}\")"
-      _store_cache "$cache_key" "${cache_key}"
-      echo "${limited_options[@]}" && ret=0
-    fi
+  # Limit results and cache them
+  local -a limited_options=(${all_options[1,$NX_MAX_OPTIONS]})
+  if [[ ${#limited_options} -gt 0 ]]; then
+    eval "${cache_key}=(\"\${limited_options[@]}\")"
+    _store_cache "$cache_key" "${cache_key}"
+    print -rl -- "${limited_options[@]}" && ret=0
   fi
   return ret
 }
@@ -705,6 +809,43 @@ _nx_get_target_executor() {
   echo "$executor"
 }
 
+# Executor used by a specific project's target (e.g. my-app + build-cdk), if it exists
+_nx_get_project_target_executor() {
+  local project="$1" target="$2"
+  local def=$(_workspace_def)
+  [[ -f "$def" ]] || return 1
+  jq -r --arg p "$project" --arg t "$target" '
+    (.graph.nodes // .nodes)[] | select(.name == $p) | .data.targets[$t]?.executor // empty
+  ' "$def" 2>/dev/null
+}
+
+# Options of the executor behind <target>. Prefers the executor of a project already typed
+# on the command line (pass the remaining words as extra args); otherwise uses the most
+# common executor for that target name. Prints nothing if no executor is found.
+_nx_get_options_for_target() {
+  local target="$1"; shift
+  local executor="" word
+  for word in "$@"; do
+    [[ "$word" == -* ]] && continue
+    executor=$(_nx_get_project_target_executor "$word" "$target")
+    [[ -n "$executor" ]] && break
+  done
+  [[ -z "$executor" ]] && executor=$(_nx_get_target_executor "$target")
+  [[ -n "$executor" ]] || return 1
+  _nx_get_executor_options "$executor"
+}
+
+# Executor options for build/test/lint/serve/e2e: the real executor's options when it can
+# be resolved, otherwise the old guess based on executor names.
+_nx_get_workspace_command_options() {
+  local target="$1"; shift
+  local -a opts=(${(f)"$(_nx_get_options_for_target "$target" "$@")"})
+  if (( ${#opts} == 0 )); then
+    opts=(${(f)"$(_nx_get_dynamic_command_options "$target")"})
+  fi
+  print -rl -- "${opts[@]}"
+}
+
 # Get dynamic options for common Nx commands based on executors
 _nx_get_dynamic_command_options() {
   local command="$1"
@@ -719,7 +860,7 @@ _nx_get_dynamic_command_options() {
 
   # Check if we have cached dynamic options and they're still valid
   if ( [[ ${(P)+cache_key} -eq 1 ]] && ! _cache_invalid "$cache_key" ); then
-    echo "${(P)cache_key[@]}"
+    print -rl -- "${(@P)cache_key}"
     return 0
   fi
 
@@ -734,9 +875,9 @@ _nx_get_dynamic_command_options() {
       local -a build_executors=(${(M)all_executors:#*build*} ${(M)all_executors:#*webpack*} ${(M)all_executors:#*browser*})
       build_executors=(${build_executors[1,3]}) # Limit to first 3 executors
       for executor in $build_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
+        local -a exec_opts=(${(f)"$(_nx_get_executor_options "$executor")"})
         dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $NX_MAX_RESULTS ]]; then
+        if [[ ${#dynamic_opts} -ge $NX_MAX_OPTIONS ]]; then
           break
         fi
       done
@@ -746,9 +887,9 @@ _nx_get_dynamic_command_options() {
       local -a test_executors=(${(M)all_executors:#*jest*} ${(M)all_executors:#*cypress*} ${(M)all_executors:#*test*})
       test_executors=(${test_executors[1,3]}) # Limit to first 3 executors
       for executor in $test_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
+        local -a exec_opts=(${(f)"$(_nx_get_executor_options "$executor")"})
         dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $NX_MAX_RESULTS ]]; then
+        if [[ ${#dynamic_opts} -ge $NX_MAX_OPTIONS ]]; then
           break
         fi
       done
@@ -758,9 +899,9 @@ _nx_get_dynamic_command_options() {
       local -a serve_executors=(${(M)all_executors:#*serve*} ${(M)all_executors:#*dev-server*})
       serve_executors=(${serve_executors[1,3]}) # Limit to first 3 executors
       for executor in $serve_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
+        local -a exec_opts=(${(f)"$(_nx_get_executor_options "$executor")"})
         dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $NX_MAX_RESULTS ]]; then
+        if [[ ${#dynamic_opts} -ge $NX_MAX_OPTIONS ]]; then
           break
         fi
       done
@@ -770,9 +911,9 @@ _nx_get_dynamic_command_options() {
       local -a lint_executors=(${(M)all_executors:#*lint*} ${(M)all_executors:#*eslint*})
       lint_executors=(${lint_executors[1,3]}) # Limit to first 3 executors
       for executor in $lint_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
+        local -a exec_opts=(${(f)"$(_nx_get_executor_options "$executor")"})
         dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $NX_MAX_RESULTS ]]; then
+        if [[ ${#dynamic_opts} -ge $NX_MAX_OPTIONS ]]; then
           break
         fi
       done
@@ -782,9 +923,9 @@ _nx_get_dynamic_command_options() {
       local -a e2e_executors=(${(M)all_executors:#*e2e*} ${(M)all_executors:#*cypress*} ${(M)all_executors:#*playwright*})
       e2e_executors=(${e2e_executors[1,3]}) # Limit to first 3 executors
       for executor in $e2e_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
+        local -a exec_opts=(${(f)"$(_nx_get_executor_options "$executor")"})
         dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $NX_MAX_RESULTS ]]; then
+        if [[ ${#dynamic_opts} -ge $NX_MAX_OPTIONS ]]; then
           break
         fi
       done
@@ -794,8 +935,8 @@ _nx_get_dynamic_command_options() {
   # Remove duplicates, limit final results, and return
   dynamic_opts=(${(u)dynamic_opts[@]})
   local -a final_opts=()
-  if [[ ${#dynamic_opts} -gt $NX_MAX_RESULTS ]]; then
-    final_opts=(${dynamic_opts[1,$NX_MAX_RESULTS]})
+  if [[ ${#dynamic_opts} -gt $NX_MAX_OPTIONS ]]; then
+    final_opts=(${dynamic_opts[1,$NX_MAX_OPTIONS]})
   else
     final_opts=(${(u)dynamic_opts[@]})
   fi
@@ -806,7 +947,7 @@ _nx_get_dynamic_command_options() {
     _store_cache "$cache_key" "${cache_key}"
   fi
 
-  echo "${final_opts[@]}"
+  print -rl -- "${final_opts[@]}"
 }
 
 # Cache-aware wrapper for dynamic option parsing
@@ -823,12 +964,12 @@ _nx_get_command_options() {
 
   # Check if we have cached options and they're still valid
   if ( [[ ${(P)+cache_key} -eq 1 ]] && ! _cache_invalid "$cache_key" ); then
-    echo "${(P)cache_key[@]}"
+    print -rl -- "${(@P)cache_key}"
     return 0
   fi
 
   # Parse options dynamically
-  local -a options=($(_nx_parse_command_options "$command"))
+  local -a options=(${(f)"$(_nx_parse_command_options "$command")"})
 
   # Cache the results if we got any
   if [[ ${#options} -gt 0 ]]; then
@@ -836,7 +977,7 @@ _nx_get_command_options() {
     _store_cache "$cache_key" "${cache_key}"
   fi
 
-  echo "${options[@]}"
+  print -rl -- "${options[@]}"
 }
 
 # Parse command-specific options from nx [command] --help
@@ -897,84 +1038,15 @@ _nx_parse_command_options() {
     done <<< "$options_section"
   fi
 
-  # Add dynamic executor options for certain commands
-  local -a all_executors=($(_nx_get_executors))
-  local -a dynamic_opts=()
-  local max_executor_opts=15
-
-  case "$command" in
-    build|b)
-      # Get options from build-related executors (limit to first few)
-      local -a build_executors=(${(M)all_executors:#*build*} ${(M)all_executors:#*webpack*} ${(M)all_executors:#*browser*})
-      build_executors=(${build_executors[1,2]}) # Limit to first 2 executors
-      for executor in $build_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
-        dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $max_executor_opts ]]; then
-          break
-        fi
-      done
-      ;;
-    test|t)
-      # Get options from test-related executors
-      local -a test_executors=(${(M)all_executors:#*jest*} ${(M)all_executors:#*cypress*} ${(M)all_executors:#*test*})
-      test_executors=(${test_executors[1,2]}) # Limit to first 2 executors
-      for executor in $test_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
-        dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $max_executor_opts ]]; then
-          break
-        fi
-      done
-      ;;
-    serve|s)
-      # Get options from serve-related executors
-      local -a serve_executors=(${(M)all_executors:#*serve*} ${(M)all_executors:#*dev-server*})
-      serve_executors=(${serve_executors[1,2]}) # Limit to first 2 executors
-      for executor in $serve_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
-        dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $max_executor_opts ]]; then
-          break
-        fi
-      done
-      ;;
-    e2e)
-      # Get options from e2e-related executors
-      local -a e2e_executors=(${(M)all_executors:#*cypress*} ${(M)all_executors:#*e2e*})
-      e2e_executors=(${e2e_executors[1,2]}) # Limit to first 2 executors
-      for executor in $e2e_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
-        dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $max_executor_opts ]]; then
-          break
-        fi
-      done
-      ;;
-    lint)
-      # Get options from lint-related executors
-      local -a lint_executors=(${(M)all_executors:#*lint*} ${(M)all_executors:#*eslint*})
-      lint_executors=(${lint_executors[1,2]}) # Limit to first 2 executors
-      for executor in $lint_executors; do
-        local -a exec_opts=($(_nx_get_executor_options "$executor"))
-        dynamic_opts+=($exec_opts)
-        if [[ ${#dynamic_opts} -ge $max_executor_opts ]]; then
-          break
-        fi
-      done
-      ;;
-  esac
-
   # Combine parsed options with dynamic options (remove duplicates and limit total)
-  parsed_options+=(${(u)dynamic_opts[@]})
 
   # Limit total options for performance
-  local max_total_opts=50
+  local max_total_opts=$NX_MAX_OPTIONS
   if [[ ${#parsed_options} -gt $max_total_opts ]]; then
     parsed_options=(${parsed_options[1,$max_total_opts]})
   fi
 
-  echo "${parsed_options[@]}"
+  print -rl -- "${parsed_options[@]}"
 }
 
 # Safe wrapper for _list_targets that prevents terminal crashes
@@ -1055,27 +1127,27 @@ _nx_command() {
     ;;
     (b|build)
       # Use dynamic parsing combined with workspace executor options
-      local -a build_opts=($(_nx_get_command_options "build"))
-      local -a workspace_opts=($(_nx_get_dynamic_command_options "build"))
+      local -a build_opts=(${(f)"$(_nx_get_command_options "build")"})
+      local -a workspace_opts=(${(f)"$(_nx_get_workspace_command_options "build" ${words[2,-1]})"})
       local -a all_opts=($build_opts $workspace_opts)
 
       if [[ ${#all_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
           ${(u)all_opts[@]} \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target build}" && ret=0
       else
         # Minimal fallback
         _arguments $(_nx_arguments) \
           $opts_help \
           "(-c --configuration)"{-c=,--configuration=}"[A named builder configuration.]:configuration:" \
           "--verbose[Display additional details about internal operations during execution.]" \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target build}" && ret=0
       fi
     ;;
     (dep-graph|graph)
       # Use dynamic parsing for graph command
-      local -a graph_opts=($(_nx_get_command_options "graph"))
+      local -a graph_opts=(${(f)"$(_nx_get_command_options "graph")"})
       if [[ ${#graph_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
@@ -1091,27 +1163,27 @@ _nx_command() {
     ;;
     (e|e2e)
       # Use dynamic parsing combined with workspace executor options
-      local -a e2e_opts=($(_nx_get_command_options "e2e"))
-      local -a workspace_opts=($(_nx_get_dynamic_command_options "e2e"))
+      local -a e2e_opts=(${(f)"$(_nx_get_command_options "e2e")"})
+      local -a workspace_opts=(${(f)"$(_nx_get_workspace_command_options "e2e" ${words[2,-1]})"})
       local -a all_opts=($e2e_opts $workspace_opts)
 
       if [[ ${#all_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
           ${(u)all_opts[@]} \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target e2e}" && ret=0
       else
         # Minimal fallback
         _arguments $(_nx_arguments) \
           $opts_help \
           "(-c --configuration)"{-c=,--configuration=}"[A named builder configuration.]:configuration:" \
           "--watch[Recompile and run tests when files change.]" \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target e2e}" && ret=0
       fi
     ;;
     (g|generate)
       # Use dynamic option parsing for generate command
-      local -a generate_opts=($(_nx_get_command_options "generate"))
+      local -a generate_opts=(${(f)"$(_nx_get_command_options "generate")"})
       if [[ ${#generate_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
@@ -1131,15 +1203,15 @@ _nx_command() {
     ;;
     (l|lint)
       # Use dynamic parsing combined with workspace executor options
-      local -a lint_opts=($(_nx_get_command_options "lint"))
-      local -a workspace_opts=($(_nx_get_dynamic_command_options "lint"))
+      local -a lint_opts=(${(f)"$(_nx_get_command_options "lint")"})
+      local -a workspace_opts=(${(f)"$(_nx_get_workspace_command_options "lint" ${words[2,-1]})"})
       local -a all_opts=($lint_opts $workspace_opts)
 
       if [[ ${#all_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
           ${(u)all_opts[@]} \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target lint}" && ret=0
       else
         # Minimal fallback
         _arguments $(_nx_arguments) \
@@ -1147,12 +1219,12 @@ _nx_command() {
           "(-c --configuration)"{-c=,--configuration=}"[The linting configuration to use.]:configuration:" \
           "--fix[Fixes linting errors (may overwrite linted files).]" \
           "--format[Output format.]:format:(prose json stylish verbose)" \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target lint}" && ret=0
       fi
     ;;
     (migrate)
       # Use dynamic parsing for migrate command
-      local -a migrate_opts=($(_nx_get_command_options "migrate"))
+      local -a migrate_opts=(${(f)"$(_nx_get_command_options "migrate")"})
       if [[ ${#migrate_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
@@ -1168,7 +1240,7 @@ _nx_command() {
     ;;
     (n|new)
       # Use dynamic parsing for new command
-      local -a new_opts=($(_nx_get_command_options "new"))
+      local -a new_opts=(${(f)"$(_nx_get_command_options "new")"})
       if [[ ${#new_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
@@ -1186,7 +1258,7 @@ _nx_command() {
     ;;
     (run-many)
       # Use dynamic option parsing for run-many command
-      local -a run_many_opts=($(_nx_get_command_options "run-many"))
+      local -a run_many_opts=(${(f)"$(_nx_get_command_options "run-many")"})
       if [[ ${#run_many_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
@@ -1213,7 +1285,7 @@ _nx_command() {
     ;;
     (run|run-one)
       # Use dynamic parsing for run command
-      local -a run_opts=($(_nx_get_command_options "run"))
+      local -a run_opts=(${(f)"$(_nx_get_command_options "run")"})
       if [[ ${#run_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
@@ -1233,15 +1305,15 @@ _nx_command() {
     ;;
     (s|serve)
       # Use dynamic parsing combined with workspace executor options
-      local -a serve_opts=($(_nx_get_command_options "serve"))
-      local -a workspace_opts=($(_nx_get_dynamic_command_options "serve"))
+      local -a serve_opts=(${(f)"$(_nx_get_command_options "serve")"})
+      local -a workspace_opts=(${(f)"$(_nx_get_workspace_command_options "serve" ${words[2,-1]})"})
       local -a all_opts=($serve_opts $workspace_opts)
 
       if [[ ${#all_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
           ${(u)all_opts[@]} \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target serve}" && ret=0
       else
         # Fallback to static options if parsing fails
         _arguments $(_nx_arguments) \
@@ -1275,12 +1347,12 @@ _nx_command() {
           "--vendorChunk[Use a separate bundle containing only vendor libraries.]" \
           "--verbose[Adds more details to output logging.]" \
           "--watch[Rebuild on change.]" \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target serve}" && ret=0
       fi
     ;;
     (show)
       # Use dynamic parsing for show command
-      local -a show_opts=($(_nx_get_command_options "show"))
+      local -a show_opts=(${(f)"$(_nx_get_command_options "show")"})
       if [[ ${#show_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
@@ -1296,15 +1368,15 @@ _nx_command() {
     ;;
     (t|test)
       # Use dynamic parsing combined with workspace executor options
-      local -a test_opts=($(_nx_get_command_options "test"))
-      local -a workspace_opts=($(_nx_get_dynamic_command_options "test"))
+      local -a test_opts=(${(f)"$(_nx_get_command_options "test")"})
+      local -a workspace_opts=(${(f)"$(_nx_get_workspace_command_options "test" ${words[2,-1]})"})
       local -a all_opts=($test_opts $workspace_opts)
 
       if [[ ${#all_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
           ${(u)all_opts[@]} \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target test}" && ret=0
       else
         # Fallback to static options if parsing fails
         _arguments $(_nx_arguments) \
@@ -1344,23 +1416,40 @@ _nx_command() {
           "--watch[Watch files for changes and rerun tests related to changed files. If you want to re-run all tests when a file has changed, use the --watchAll option (https://jestjs.io/docs/en/cli#watch).]" \
           "--watchAll[Watch files for changes and rerun all tests when something changes. If you want to re-run only the tests that depend on the changed files, use the --watch option. (https://jestjs.io/docs/en/cli#watchall)]" \
           "--skipNxCache[Rerun the tasks even when the results are available in the cache.]" \
-          ":project:_list_projects" && ret=0
+          ":project:{_nx_list_projects_for_target test}" && ret=0
       fi
     ;;
     (*)
       # Generic handler for any unrecognized commands - try dynamic parsing
       local command_name="${words[1]}"
-      local -a dynamic_opts=($(_nx_get_command_options "$command_name"))
+      local -a dynamic_opts=(${(f)"$(_nx_get_command_options "$command_name")"})
+
+      # If the command is a workspace target (e.g. `nx apply-cdk <project>`),
+      # offer project names as the positional argument.
+      local -a project_arg=()
+      local -a known_targets=()
+      _get_workspace_items_array "targets_all" known_targets
+      if (( ${known_targets[(Ie)$command_name]} )); then
+        project_arg=(":project:{_nx_list_projects_for_target $command_name}")
+
+        # Add the options of the executor behind this target (the typed project's
+        # executor if there is one, otherwise the most common executor for the target).
+        dynamic_opts+=(${(f)"$(_nx_get_options_for_target "$command_name" ${words[2,-1]})"})
+        dynamic_opts=(${(u)dynamic_opts[@]})
+      fi
+
       if [[ ${#dynamic_opts} -gt 0 ]]; then
         _arguments $(_nx_arguments) \
           $opts_help \
-          $dynamic_opts && ret=0
+          $dynamic_opts \
+          $project_arg && ret=0
       else
         # Fallback to basic help and common options if command not recognized
         _arguments $(_nx_arguments) \
           $opts_help \
           "--version[Show version number.]" \
-          "--verbose[Print additional error stack trace on failure.]" && ret=0
+          "--verbose[Print additional error stack trace on failure.]" \
+          $project_arg && ret=0
       fi
     ;;
   esac

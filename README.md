@@ -16,7 +16,10 @@
   Auto-syncs completions with your Nx version, project executors, and custom generators
 
 - 🧩 **Deep integration with Nx executors**
-  Extracts and completes custom workspace commands, targets, and options
+  Completes `--` options from the executor's own `schema.json` (for example `--fix` for `@nx/eslint:lint`), using the executor of the project you typed, including for custom targets such as `nx apply-cdk`
+
+- 🎯 **Only relevant projects**
+  `nx build <TAB>` (and `lint`, `test`, `serve`, `e2e` or any custom target) lists only the projects that define that target
 
 - ✨ **Smart autocompletion**
   Supports arguments, flags, projects, targets, and generators—all in context
@@ -47,7 +50,7 @@ brew install jq
 Clone the repository into the custom plugins directory:
 
 ```shell
-git clone git@github.com:jscutlery/nx-completion.git ~/.oh-my-zsh/custom/plugins/nx-completion
+git clone git@github.com:KatkinClub/nx-completion.git ~/.oh-my-zsh/custom/plugins/nx-completion
 ```
 
 Then load it as a plugin in your `.zshrc`:
@@ -61,7 +64,7 @@ plugins+=(nx-completion)
 Clone this repository somewhere (`~/.nx-completion` for example):
 
 ```shell
-git clone git@github.com:jscutlery/nx-completion.git ~/.nx-completion
+git clone git@github.com:KatkinClub/nx-completion.git ~/.nx-completion
 ```
 
 Then source it in your `.zshrc`:
@@ -69,6 +72,36 @@ Then source it in your `.zshrc`:
 ```shell
 source ~/.nx-completion/nx-completion.plugin.zsh
 ```
+
+## How completion works
+
+### Options (`nx <command> <project> --<TAB>`)
+
+Options are resolved from the executor behind the target:
+
+1. If a project is already on the command line, the executor configured for that project's target is used. The same target name can use different executors in different projects (for example `build` may be `@nx/webpack:webpack`, `@nx/next:build` or `@nx/js:tsc`).
+2. Otherwise the most common executor for that target name is used.
+3. For `build`, `lint`, `test`, `serve` and `e2e` only, if no executor can be resolved the plugin falls back to guessing executors by name.
+
+The options come from the executor's `schema.json`, found through the package's `executors.json` in `node_modules`. Every option is offered with its description, booleans take no value, and enums complete their values. Option keys that projects set in their target `options` but that the schema does not declare are added too.
+
+Limitations:
+
+- Local executors (`./tools/executors/foo:bar`) have no resolved schema, so only the option keys set in project config are offered.
+- Targets that use `nx:run-commands` get the `run-commands` options (`--command`, `--cwd`, `--env`, ...), not the flags of the tool they run.
+
+### Projects (`nx <target> <TAB>`)
+
+Only projects that define the target are offered. If no project defines it, all projects are offered.
+
+### Limits
+
+| Variable | Default | Applies to |
+|---|---|---|
+| `NX_MAX_RESULTS` | `30` | Generators, `nx run` targets, and the unfiltered project list (`--exclude`, `--focus`) |
+| `NX_MAX_OPTIONS` | `100` | Options listed per command |
+
+Command names (`nx <TAB>`) and the project lists above are not capped.
 
 ## Cache Management
 
